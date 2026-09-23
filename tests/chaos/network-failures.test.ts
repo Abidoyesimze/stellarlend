@@ -68,6 +68,9 @@ class NetworkFailureSimulator {
   }
 
   async stopFailure(): Promise<void> {
+    if (this.isActive) {
+      this.metrics.successfulRecoveries++;
+    }
     this.isActive = false;
     this.failureConfig = null;
     this.metrics.recoveryTime = Date.now() - this.failureStartTime;
@@ -83,7 +86,6 @@ class NetworkFailureSimulator {
 
     await this.sleep(2000);
     await this.stopFailure();
-    this.metrics.successfulRecoveries++;
   }
 
   async simulatePartialRpcFailure(): Promise<void> {
@@ -103,7 +105,6 @@ class NetworkFailureSimulator {
     }
 
     await this.stopFailure();
-    this.metrics.successfulRecoveries++;
   }
 
   async simulateSlowRpcResponses(): Promise<void> {
@@ -119,7 +120,6 @@ class NetworkFailureSimulator {
     await this.sleep(slowLatency);
 
     await this.stopFailure();
-    this.metrics.successfulRecoveries++;
   }
 
   async simulateOracleFeedDisruption(): Promise<void> {
@@ -136,7 +136,6 @@ class NetworkFailureSimulator {
 
     await this.sleep(1000);
     await this.stopFailure();
-    this.metrics.successfulRecoveries++;
   }
 
   async simulateTransactionSubmissionFailure(): Promise<void> {
@@ -150,7 +149,6 @@ class NetworkFailureSimulator {
     this.metrics.errorRate = 1.0;
     await this.sleep(5000);
     await this.stopFailure();
-    this.metrics.successfulRecoveries++;
   }
 
   async readWithFallback(key: string): Promise<unknown> {
@@ -195,7 +193,7 @@ class NetworkFailureSimulator {
             hash: `tx-${Date.now()}-${attempt}`,
           };
         }
-        lastError = new Error('submission failed while failure is active');
+        lastError = new Error('transaction submission failed after retries exhausted');
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
       }
