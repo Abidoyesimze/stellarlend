@@ -82,6 +82,8 @@ mod insurance_test;
 #[cfg(test)]
 mod invariant_prop_test;
 #[cfg(test)]
+mod initialize_test;
+#[cfg(test)]
 mod math_safety_test;
 #[cfg(test)]
 mod pause_test;
