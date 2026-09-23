@@ -3271,6 +3271,8 @@ name = "stellarlend-lending"
 version = "0.1.0"
 dependencies = [
  "delegation-registry",
+ "proptest",
+ "serde_json",
  "shared-events",
  "soroban-sdk",
  "soroban-token-sdk",
