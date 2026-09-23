@@ -316,8 +316,8 @@ impl LiquidationStrategyContract {
         if env.storage().instance().has(&DataKey::Governance) {
             panic!("Already initialized");
         }
+        governance.require_auth();
         admin.require_auth();
-
         env.storage()
             .instance()
             .set(&DataKey::Governance, &governance);
@@ -588,6 +588,17 @@ mod tests {
         let other_gov = Address::generate(&te.env);
         let other_admin = Address::generate(&te.env);
         client(&te).initialize(&other_gov, &other_admin);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_initialize_requires_authority_auth() {
+        let env = Env::default();
+        let governance = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let contract_id = env.register(LiquidationStrategyContract, ());
+        LiquidationStrategyContractClient::new(&env, &contract_id)
+            .initialize(&governance, &admin);
     }
 
     #[test]
