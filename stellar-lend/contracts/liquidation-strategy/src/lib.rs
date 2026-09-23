@@ -6,6 +6,10 @@ pub mod hello_world_bridge;
 
 // ── Strategy types ───────────────────────────────────────────────────────────
 
+// New modules for Issue #696
+pub mod performance;
+pub mod traits;
+
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
 pub enum StrategyType {
