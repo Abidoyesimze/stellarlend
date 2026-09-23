@@ -139,6 +139,7 @@ impl StellarLendDebtToken {
         if env.storage().instance().has(&storage::INITIALIZED) {
             return Err(DebtTokenError::AlreadyInitialized);
         }
+        admin.require_auth();
 
         let config = DebtTokenConfig {
             admin,

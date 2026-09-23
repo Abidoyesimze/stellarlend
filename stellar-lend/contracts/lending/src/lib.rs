@@ -114,6 +114,7 @@ impl LendingContract {
         if get_borrow_admin(&env).is_some() {
             return Err(BorrowError::Unauthorized);
         }
+        admin.require_auth();
         set_borrow_admin(&env, &admin);
         initialize_borrow_logic(&env, debt_ceiling, min_borrow_amount)?;
         Ok(())

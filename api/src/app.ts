@@ -163,9 +163,17 @@ const userRateLimiter = rateLimit({
   max: 10, // 10 requests per minute per user
   store: userRateLimitStore,
   keyGenerator: (req) => {
-    // Try to get userAddress from request body first, then query params, then fall back to IP
-    const userAddress = req.body?.userAddress || req.query?.userAddress || req.ip;
-    return userAddress;
+    // Prioritize verified authenticated principal from JWT or API key
+    const authUser = (req as { user?: { address?: string } }).user?.address;
+    if (authUser) {
+      return `auth:${authUser}`;
+    }
+    // For unauthenticated callers, bind to IP so rotating userAddress does not yield fresh buckets
+    const claimedAddress = req.body?.userAddress || req.query?.userAddress || req.headers?.['x-user-address'];
+    if (claimedAddress && typeof claimedAddress === 'string') {
+      return `ip-claim:${req.ip}:${claimedAddress}`;
+    }
+    return `ip:${req.ip}`;
   },
   message: { success: false, error: 'Too many requests for this account' },
   standardHeaders: true,
