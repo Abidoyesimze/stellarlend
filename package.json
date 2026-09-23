@@ -21,6 +21,8 @@
     "format:all": "npm run format:api && npm run format:oracle",
     "typecheck:all": "npm run typecheck:api && npm run typecheck:oracle",
     "test:all": "npm run test --workspace=api && npm run test --workspace=oracle",
+    "test:chaos": "bash scripts/fuzz/run_chaos.sh run",
+    "test:e2e": "npm --prefix tests/e2e test",
     "build:all": "npm run build --workspace=api && npm run build --workspace=oracle",
     "install:all": "npm install --workspaces",
     "gas:baseline": "bash scripts/gas-report.sh baseline",
