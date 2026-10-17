@@ -127,7 +127,9 @@ pub enum BorrowDataKey {
     /// Stable rate premium in basis points
     StableRatePremiumBps,
     /// Stable rate recalculation interval in seconds
-    StableRateRecalcInterval,
+    StableRateRecalcIntervalSecs,
+    /// Switch fee in basis points applied when switching rate types
+    RateSwitchFeeBps,
     /// Transaction-scoped oracle price cache. Never persists across ledgers.
     OraclePriceCache(Address),
 }
@@ -744,7 +746,9 @@ pub(crate) fn calculate_interest(env: &Env, position: &DebtPosition) -> Result<i
 fn get_asset_price(env: &Env, oracle: &Address, asset: &Address) -> i128 {
     let cache_key = BorrowDataKey::OraclePriceCache(asset.clone());
     let now = env.ledger().timestamp();
-    if let Some((cached_at, cached_price)) = env.storage().temporary().get(&cache_key) {
+    if let Some((cached_at, cached_price)) =
+        env.storage().temporary().get::<_, (u64, i128)>(&cache_key)
+    {
         if cached_at == now {
             return cached_price;
         }
