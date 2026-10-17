@@ -10,7 +10,7 @@
 mod common;
 
 use common::*;
-use soroban_sdk::testutils::{Address as _, Events as _};
+use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
 use soroban_sdk::xdr::{ContractEventBody, ScAddress, ScVal};
 use soroban_sdk::Address;
 
@@ -85,4 +85,42 @@ fn lending_entry_points_emit_indexable_events() {
 
     f.client.deposit_collateral(&user, ca, &500);
     expect_event(&last_call_events(&f), "borrow_collateral_deposit_event", &["asset", "amount"]);
+}
+
+#[test]
+fn liquidation_and_risk_config_emit_indexable_events() {
+    let f = setup();
+    let (ca, da) = (&f.collateral_asset, &f.debt_asset);
+    let borrower = Address::generate(&f.env);
+    let liquidator = Address::generate(&f.env);
+
+    f.client.set_liquidation_incentive_bps(&f.admin, &800);
+    expect_event(&last_call_events(&f), "liq_incentive_updated_event", &["asset", "previous_bps", "new_bps"]);
+
+    f.client.set_asset_liq_incentive_bps(&f.admin, ca, &Some(600));
+    expect_event(&last_call_events(&f), "liq_incentive_updated_event", &["asset", "previous_bps", "new_bps"]);
+
+    f.client.set_interest_rate_config(
+        &f.admin,
+        &stellarlend_lending::InterestRateConfigUpdate {
+            base_rate_bps: Some(400),
+            kink_utilization_bps: None,
+            slope_bps: None,
+            jump_slope_bps: None,
+            rate_floor_bps: None,
+            rate_ceiling_bps: None,
+            spread_bps: None,
+        },
+    );
+    expect_event(&last_call_events(&f), "rate_config_updated_event", &["base_rate_bps", "slope_bps"]);
+
+    f.client.borrow(&borrower, da, &1_000, ca, &1_500);
+    f.oracle_client().set_price(ca, &(PRICE_SCALE / 2));
+    f.env.ledger().with_mut(|l| l.timestamp += 1);
+    f.client.liquidate(&liquidator, &borrower, da, ca, &100);
+    expect_event(
+        &last_call_events(&f),
+        "liquidation_event",
+        &["debt_liquidated", "collateral_seized", "incentive_amount"],
+    );
 }
