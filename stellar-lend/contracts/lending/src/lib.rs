@@ -8,7 +8,7 @@
 #[cfg(any(test, feature = "spec"))]
 extern crate alloc;
 
-use soroban_sdk::{contract, contractimpl, Address, Bytes, BytesN, Env, Val, Vec};
+use soroban_sdk::{contract, contractimpl, Address, Bytes, BytesN, Env, Map, Val, Vec};
 
 mod borrow;
 mod calldata;
@@ -20,6 +20,7 @@ mod flash_loan;
 mod hot_storage;
 mod interest_rate;
 mod lazy;
+mod liquidate;
 mod pause;
 mod reentrancy;
 mod risk_monitor;
@@ -50,7 +51,11 @@ use borrow::{
     set_liquidation_threshold_bps as set_liquidation_threshold_logic,
     set_oracle as set_oracle_logic, set_variable_borrow_rate_bps as set_variable_borrow_rate_logic,
     sweep_debt_dust as borrow_sweep_debt_dust, switch_rate_type as switch_rate_type_logic,
-    BorrowCollateral, BorrowError, DebtPosition, RateType,
+    BorrowCollateral, DebtPosition, RateType,
+};
+pub use borrow::{
+    BorrowError, DEFAULT_LIQUIDATION_INCENTIVE_BPS, MAX_COLLATERAL_ASSETS,
+    MAX_LIQUIDATION_INCENTIVE_BPS, MIN_LIQUIDATION_INCENTIVE_BPS,
 };
 use calldata::{CalldataError, CompressedOp};
 use deposit::{
@@ -62,7 +67,9 @@ use flash_loan::{
     flash_loan as flash_loan_logic, set_flash_loan_fee_bps as set_flash_loan_fee_logic,
     FlashLoanError,
 };
+pub use interest_rate::{InterestRateConfig, InterestRateConfigUpdate};
 use lazy::{LazyField, PoolStateView};
+pub use liquidate::LiquidationResult;
 use pause::{is_paused, set_pause as set_pause_logic};
 /// Re-exported so integrators (and the `tests/` suites) can build `set_pause`
 /// and `guardian_pause` arguments.
@@ -342,21 +349,31 @@ impl LendingContract {
         borrow_deposit(&env, user, asset, amount)
     }
 
-    /// Liquidate a position
+    /// Liquidate an unhealthy position: repay up to `amount` of the
+    /// borrower's `debt_asset` debt (capped by the close factor) and seize
+    /// `collateral_asset` worth the repaid value plus that asset's
+    /// liquidation incentive. The health factor covers every collateral
+    /// asset the borrower holds.
     pub fn liquidate(
         env: Env,
         liquidator: Address,
-        _borrower: Address,
-        _debt_asset: Address,
-        _collateral_asset: Address,
-        _amount: i128,
-    ) -> Result<(), BorrowError> {
+        borrower: Address,
+        debt_asset: Address,
+        collateral_asset: Address,
+        amount: i128,
+    ) -> Result<LiquidationResult, BorrowError> {
         liquidator.require_auth();
         if is_paused(&env, PauseType::Liquidation) {
             return Err(BorrowError::ProtocolPaused);
         }
-        // Stub implementation, or call borrow::liquidate if it exists
-        Ok(())
+        liquidate::liquidate(
+            &env,
+            liquidator,
+            borrower,
+            debt_asset,
+            collateral_asset,
+            amount,
+        )
     }
 
     /// Get user's debt position
@@ -369,9 +386,17 @@ impl LendingContract {
         get_borrow_debt_with_rate(&env, &user, rate_type)
     }
 
-    /// Get user's collateral position (borrow module)
+    /// Get user's collateral position (borrow module). For a position with
+    /// several collateral assets this is the asset with the largest balance;
+    /// use `get_user_collaterals` for all of them.
     pub fn get_user_collateral(env: Env, user: Address) -> BorrowCollateral {
         get_borrow_collateral(&env, &user)
+    }
+
+    /// Every collateral asset backing the user's borrow position, with its
+    /// raw balance.
+    pub fn get_user_collaterals(env: Env, user: Address) -> Map<Address, i128> {
+        borrow::get_collateral_balances(&env, &user)
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -420,6 +445,72 @@ impl LendingContract {
         bps: i128,
     ) -> Result<(), BorrowError> {
         set_liquidation_threshold_logic(&env, &admin, bps)
+    }
+
+    /// Set the global liquidation incentive in basis points (admin only),
+    /// applied to collateral assets without an override. Must be within
+    /// `MIN_LIQUIDATION_INCENTIVE_BPS..=MAX_LIQUIDATION_INCENTIVE_BPS`.
+    pub fn set_liquidation_incentive_bps(
+        env: Env,
+        admin: Address,
+        bps: i128,
+    ) -> Result<(), BorrowError> {
+        borrow::set_liquidation_incentive_bps(&env, &admin, bps)
+    }
+
+    /// Global liquidation incentive in basis points.
+    pub fn get_liquidation_incentive_bps(env: Env) -> i128 {
+        borrow::get_liquidation_incentive_bps(&env)
+    }
+
+    /// Set (`Some`) or clear (`None`) the liquidation incentive for one
+    /// collateral asset (admin only). Same bounds as the global incentive.
+    pub fn set_asset_liq_incentive_bps(
+        env: Env,
+        admin: Address,
+        collateral_asset: Address,
+        bps: Option<i128>,
+    ) -> Result<(), BorrowError> {
+        borrow::set_asset_liquidation_incentive_bps(&env, &admin, &collateral_asset, bps)
+    }
+
+    /// Liquidation incentive in effect when `collateral_asset` is seized:
+    /// its override if set, otherwise the global incentive.
+    pub fn get_asset_liq_incentive_bps(env: Env, collateral_asset: Address) -> i128 {
+        borrow::get_asset_liquidation_incentive_bps(&env, &collateral_asset)
+    }
+
+    /// Current interest rate model parameters.
+    pub fn get_interest_rate_config(env: Env) -> InterestRateConfig {
+        interest_rate::get_config(&env)
+    }
+
+    /// Update interest rate model parameters (admin only). `None` fields are
+    /// left unchanged; every value is validated before anything is written.
+    /// Returns the new configuration.
+    pub fn set_interest_rate_config(
+        env: Env,
+        admin: Address,
+        update: InterestRateConfigUpdate,
+    ) -> Result<InterestRateConfig, BorrowError> {
+        let (_, next) = interest_rate::update_config(&env, &admin, update)?;
+        Ok(next)
+    }
+
+    /// Current borrow rate in basis points per year, from the rate model and
+    /// pool utilization.
+    pub fn get_borrow_rate_bps(env: Env) -> Result<i128, BorrowError> {
+        Ok(interest_rate::borrow_rate_bps(&env)?)
+    }
+
+    /// Current supply rate in basis points per year (borrow rate minus spread).
+    pub fn get_supply_rate_bps(env: Env) -> Result<i128, BorrowError> {
+        Ok(interest_rate::supply_rate_bps(&env)?)
+    }
+
+    /// Pool utilization in basis points (total debt / debt ceiling).
+    pub fn get_utilization_bps(env: Env) -> Result<i128, BorrowError> {
+        Ok(interest_rate::utilization_bps(&env)?)
     }
 
     /// Initialize deposit settings (admin only)

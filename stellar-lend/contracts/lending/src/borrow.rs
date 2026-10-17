@@ -17,7 +17,7 @@ pub type DepositEvent = BorrowCollateralDepositEvent;
 
 use crate::pause::{self, PauseType};
 use crate::reentrancy::ReentrancyGuard;
-use soroban_sdk::{contracterror, contracttype, Address, Env, IntoVal, Symbol, I256};
+use soroban_sdk::{contracterror, contracttype, Address, Env, IntoVal, Map, Symbol, I256};
 
 #[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +58,14 @@ pub enum BorrowError {
     ReentrancyDetected = 12,
     /// Utilization circuit breaker is throttling new borrows
     UtilizationThrottled = 13,
+    /// Position already holds `MAX_COLLATERAL_ASSETS` distinct collateral assets
+    TooManyCollateralAssets = 14,
+    /// A borrower cannot liquidate their own position
+    SelfLiquidation = 15,
+    /// The oracle has no usable price for an asset the operation depends on
+    PriceUnavailable = 16,
+    /// Liquidation incentive is outside the allowed bounds
+    IncentiveOutOfBounds = 17,
 }
 
 /// Borrow on behalf of a user when authorization is provided via a trusted delegate.
@@ -132,6 +140,12 @@ pub enum BorrowDataKey {
     RateSwitchFeeBps,
     /// Transaction-scoped oracle price cache. Never persists across ledgers.
     OraclePriceCache(Address),
+    /// Per-user collateral balances, keyed by asset. Supersedes the
+    /// single-asset `BorrowUserCollateral` record, which is migrated on the
+    /// first write.
+    BorrowUserCollaterals(Address),
+    /// Per-asset liquidation incentive override in basis points
+    AssetLiquidationIncentiveBps(Address),
 }
 
 /// Dynamic stablecoin configuration.
@@ -183,6 +197,20 @@ pub struct BorrowCollateral {
 }
 
 const COLLATERAL_RATIO_MIN: i128 = 15000; // 150% in basis points
+
+/// Most distinct collateral assets one position may hold. Bounds the oracle
+/// calls a health-factor check or liquidation makes per position.
+pub const MAX_COLLATERAL_ASSETS: u32 = 8;
+
+/// Lowest liquidation incentive (1%): below this, liquidating is rarely worth
+/// a liquidator's gas, so unhealthy positions would linger.
+pub const MIN_LIQUIDATION_INCENTIVE_BPS: i128 = 100;
+/// Highest liquidation incentive (25%). Together with the default 80%
+/// liquidation threshold this keeps `threshold * (1 + incentive) <= 100%`,
+/// so a liquidation never seizes more value than backs the debt it repays.
+pub const MAX_LIQUIDATION_INCENTIVE_BPS: i128 = 2500;
+/// Incentive used when neither a per-asset nor a global value is set.
+pub const DEFAULT_LIQUIDATION_INCENTIVE_BPS: i128 = 1000;
 const SECONDS_PER_YEAR: u64 = 31536000;
 
 const DEFAULT_STABLE_PREMIUM_BPS: i128 = 100; // 1%
@@ -433,15 +461,8 @@ fn borrow_inner(
         debt_position.stable_rate_bps = get_current_stable_rate_bps(env)?;
     }
 
-    let mut collateral_position = get_collateral_position(env, &user);
-    collateral_position.amount = collateral_position
-        .amount
-        .checked_add(collateral_amount)
-        .ok_or(BorrowError::Overflow)?;
-    collateral_position.asset = collateral_asset.clone();
-
     save_debt_position(env, &user, &debt_position);
-    save_collateral_position(env, &user, &collateral_position);
+    add_collateral(env, &user, &collateral_asset, collateral_amount)?;
     set_total_debt(env, new_total);
 
     // Lazy pool state (#1046): the borrow-index snapshot is only materialised
@@ -472,21 +493,7 @@ pub fn deposit(env: &Env, user: Address, asset: Address, amount: i128) -> Result
         return Err(BorrowError::InvalidAmount);
     }
 
-    let mut collateral_position = get_collateral_position(env, &user);
-
-    // If it's the first deposit, set the asset
-    if collateral_position.amount == 0 {
-        collateral_position.asset = asset.clone();
-    } else if collateral_position.asset != asset {
-        return Err(BorrowError::AssetNotSupported);
-    }
-
-    collateral_position.amount = collateral_position
-        .amount
-        .checked_add(amount)
-        .ok_or(BorrowError::Overflow)?;
-
-    save_collateral_position(env, &user, &collateral_position);
+    add_collateral(env, &user, &asset, amount)?;
 
     BorrowCollateralDepositEvent {
         user,
@@ -743,7 +750,7 @@ pub(crate) fn calculate_interest(env: &Env, position: &DebtPosition) -> Result<i
     interest_256.to_i128().ok_or(BorrowError::Overflow)
 }
 
-fn get_asset_price(env: &Env, oracle: &Address, asset: &Address) -> i128 {
+pub(crate) fn get_asset_price(env: &Env, oracle: &Address, asset: &Address) -> i128 {
     let cache_key = BorrowDataKey::OraclePriceCache(asset.clone());
     let now = env.ledger().timestamp();
     if let Some((cached_at, cached_price)) =
@@ -763,7 +770,7 @@ fn get_asset_price(env: &Env, oracle: &Address, asset: &Address) -> i128 {
     price
 }
 
-fn get_debt_position(
+pub(crate) fn get_debt_position(
     env: &Env,
     user: &Address,
     default_asset: Option<&Address>,
@@ -806,7 +813,7 @@ fn get_debt_position(
         })
 }
 
-fn save_debt_position(env: &Env, user: &Address, position: &DebtPosition) {
+pub(crate) fn save_debt_position(env: &Env, user: &Address, position: &DebtPosition) {
     let key = match position.rate_type {
         RateType::Variable => BorrowDataKey::BorrowUserVariableDebt(user.clone()),
         RateType::Stable => BorrowDataKey::BorrowUserStableDebt(user.clone()),
@@ -862,20 +869,96 @@ fn update_compat_user_debt(env: &Env, user: &Address) {
     }
 }
 
-fn get_collateral_position(env: &Env, user: &Address) -> BorrowCollateral {
-    env.storage()
+/// Collateral balances of `user`, keyed by asset. Positions written before
+/// multi-collateral support are read from the legacy single-asset record.
+pub fn get_collateral_balances(env: &Env, user: &Address) -> Map<Address, i128> {
+    if let Some(balances) = env
+        .storage()
         .persistent()
-        .get(&BorrowDataKey::BorrowUserCollateral(user.clone()))
-        .unwrap_or(BorrowCollateral {
-            amount: 0,
-            asset: user.clone(),
-        })
+        .get(&BorrowDataKey::BorrowUserCollaterals(user.clone()))
+    {
+        return balances;
+    }
+
+    let mut balances = Map::new(env);
+    if let Some(legacy) = env
+        .storage()
+        .persistent()
+        .get::<_, BorrowCollateral>(&BorrowDataKey::BorrowUserCollateral(user.clone()))
+    {
+        if legacy.amount > 0 {
+            balances.set(legacy.asset, legacy.amount);
+        }
+    }
+    balances
 }
 
-fn save_collateral_position(env: &Env, user: &Address, position: &BorrowCollateral) {
+fn save_collateral_balances(env: &Env, user: &Address, balances: &Map<Address, i128>) {
+    env.storage().persistent().set(
+        &BorrowDataKey::BorrowUserCollaterals(user.clone()),
+        balances,
+    );
+    // The map now holds everything the legacy record did.
     env.storage()
         .persistent()
-        .set(&BorrowDataKey::BorrowUserCollateral(user.clone()), position);
+        .remove(&BorrowDataKey::BorrowUserCollateral(user.clone()));
+}
+
+/// Credit `amount` of `asset` to `user`'s collateral. Returns the new balance.
+pub(crate) fn add_collateral(
+    env: &Env,
+    user: &Address,
+    asset: &Address,
+    amount: i128,
+) -> Result<i128, BorrowError> {
+    let mut balances = get_collateral_balances(env, user);
+    let current = balances.get(asset.clone()).unwrap_or(0);
+    if current == 0 && balances.len() >= MAX_COLLATERAL_ASSETS {
+        return Err(BorrowError::TooManyCollateralAssets);
+    }
+    let updated = current.checked_add(amount).ok_or(BorrowError::Overflow)?;
+    balances.set(asset.clone(), updated);
+    save_collateral_balances(env, user, &balances);
+    Ok(updated)
+}
+
+/// Debit `amount` of `asset` from `user`'s collateral, dropping the asset
+/// once its balance reaches zero. Returns the new balance.
+pub(crate) fn remove_collateral(
+    env: &Env,
+    user: &Address,
+    asset: &Address,
+    amount: i128,
+) -> Result<i128, BorrowError> {
+    let mut balances = get_collateral_balances(env, user);
+    let current = balances.get(asset.clone()).unwrap_or(0);
+    if amount > current {
+        return Err(BorrowError::InsufficientCollateral);
+    }
+    let updated = current - amount;
+    if updated == 0 {
+        balances.remove(asset.clone());
+    } else {
+        balances.set(asset.clone(), updated);
+    }
+    save_collateral_balances(env, user, &balances);
+    Ok(updated)
+}
+
+/// Single-asset view of a position, kept for callers that predate
+/// multi-collateral support: the asset with the largest raw balance. Use
+/// [`get_collateral_balances`] to see every asset.
+fn get_collateral_position(env: &Env, user: &Address) -> BorrowCollateral {
+    let mut primary = BorrowCollateral {
+        amount: 0,
+        asset: user.clone(),
+    };
+    for (asset, amount) in get_collateral_balances(env, user).iter() {
+        if amount > primary.amount {
+            primary = BorrowCollateral { amount, asset };
+        }
+    }
+    primary
 }
 
 pub(crate) fn get_total_debt(env: &Env) -> i128 {
@@ -885,7 +968,7 @@ pub(crate) fn get_total_debt(env: &Env) -> i128 {
         .unwrap_or(0)
 }
 
-fn set_total_debt(env: &Env, amount: i128) {
+pub(crate) fn set_total_debt(env: &Env, amount: i128) {
     env.storage()
         .persistent()
         .set(&BorrowDataKey::BorrowTotalDebt, &amount);
@@ -1050,12 +1133,71 @@ pub fn get_close_factor_bps(env: &Env) -> i128 {
         .unwrap_or(5000)
 }
 
-/// Returns liquidation incentive in basis points (e.g. 1000 = 10%). Default 1000 if not set.
+/// Returns the global liquidation incentive in basis points (e.g. 1000 = 10%),
+/// used for assets without an override. Default 1000 if not set.
 pub fn get_liquidation_incentive_bps(env: &Env) -> i128 {
     env.storage()
         .persistent()
         .get(&BorrowDataKey::LiquidationIncentiveBps)
-        .unwrap_or(1000)
+        .unwrap_or(DEFAULT_LIQUIDATION_INCENTIVE_BPS)
+}
+
+/// Liquidation incentive applied when `collateral_asset` is seized: the
+/// asset's override if one is set, otherwise the global incentive.
+pub fn get_asset_liquidation_incentive_bps(env: &Env, collateral_asset: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&BorrowDataKey::AssetLiquidationIncentiveBps(
+            collateral_asset.clone(),
+        ))
+        .unwrap_or_else(|| get_liquidation_incentive_bps(env))
+}
+
+fn validate_liquidation_incentive(bps: i128) -> Result<(), BorrowError> {
+    if !(MIN_LIQUIDATION_INCENTIVE_BPS..=MAX_LIQUIDATION_INCENTIVE_BPS).contains(&bps) {
+        return Err(BorrowError::IncentiveOutOfBounds);
+    }
+    Ok(())
+}
+
+fn require_admin(env: &Env, admin: &Address) -> Result<(), BorrowError> {
+    let current = get_admin(env).ok_or(BorrowError::Unauthorized)?;
+    if *admin != current {
+        return Err(BorrowError::Unauthorized);
+    }
+    admin.require_auth();
+    Ok(())
+}
+
+/// Set (`Some`) or clear (`None`) the liquidation incentive for one
+/// collateral asset (admin only). Cleared assets fall back to the global
+/// incentive.
+pub fn set_asset_liquidation_incentive_bps(
+    env: &Env,
+    admin: &Address,
+    collateral_asset: &Address,
+    bps: Option<i128>,
+) -> Result<(), BorrowError> {
+    require_admin(env, admin)?;
+    let previous = get_asset_liquidation_incentive_bps(env, collateral_asset);
+    let key = BorrowDataKey::AssetLiquidationIncentiveBps(collateral_asset.clone());
+    match bps {
+        Some(bps) => {
+            validate_liquidation_incentive(bps)?;
+            env.storage().persistent().set(&key, &bps);
+        }
+        None => env.storage().persistent().remove(&key),
+    }
+
+    crate::events::LiqIncentiveUpdatedEvent {
+        admin: admin.clone(),
+        asset: Some(collateral_asset.clone()),
+        previous_bps: previous,
+        new_bps: get_asset_liquidation_incentive_bps(env, collateral_asset),
+        timestamp: env.ledger().timestamp(),
+    }
+    .publish(env);
+    Ok(())
 }
 
 /// Set oracle address for price feeds (admin only). Caller must be admin and authorize.
@@ -1107,23 +1249,28 @@ pub fn set_close_factor_bps(env: &Env, admin: &Address, bps: i128) -> Result<(),
     Ok(())
 }
 
-/// Set liquidation incentive in basis points (admin only). E.g. 1000 = 10%.
+/// Set the global liquidation incentive in basis points (admin only), used
+/// for assets without an override. E.g. 1000 = 10%.
 pub fn set_liquidation_incentive_bps(
     env: &Env,
     admin: &Address,
     bps: i128,
 ) -> Result<(), BorrowError> {
-    let current = get_admin(env).ok_or(BorrowError::Unauthorized)?;
-    if *admin != current {
-        return Err(BorrowError::Unauthorized);
-    }
-    admin.require_auth();
-    if !(0..=10000).contains(&bps) {
-        return Err(BorrowError::InvalidAmount);
-    }
+    require_admin(env, admin)?;
+    validate_liquidation_incentive(bps)?;
+    let previous = get_liquidation_incentive_bps(env);
     env.storage()
         .persistent()
         .set(&BorrowDataKey::LiquidationIncentiveBps, &bps);
+
+    crate::events::LiqIncentiveUpdatedEvent {
+        admin: admin.clone(),
+        asset: None,
+        previous_bps: previous,
+        new_bps: bps,
+        timestamp: env.ledger().timestamp(),
+    }
+    .publish(env);
     Ok(())
 }
 
@@ -1182,4 +1329,8 @@ stellarlend_errors::impl_contract_error! {
     InsufficientReserves => Insufficient, "Insufficient reserves to recover bad debt", ContactAdmin;
     ReentrancyDetected => Reentrancy, "Reentrant call detected";
     UtilizationThrottled => LimitExceeded, "Utilization circuit breaker is throttling new borrows", RetryLater;
+    TooManyCollateralAssets => LimitExceeded, "Position already holds the maximum number of collateral assets";
+    SelfLiquidation => Unauthorized, "A borrower cannot liquidate their own position";
+    PriceUnavailable => InvalidState, "The oracle has no usable price for a required asset", RetryLater;
+    IncentiveOutOfBounds => InvalidInput, "Liquidation incentive is outside the allowed bounds";
 }

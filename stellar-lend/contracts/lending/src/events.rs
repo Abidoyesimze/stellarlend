@@ -37,6 +37,37 @@ pub struct BorrowCollateralDepositEvent {
     pub timestamp: u64,
 }
 
+/// Liquidation incentive changed. `asset` is the collateral asset whose
+/// override changed, or `None` for the global incentive. `new_bps` is the
+/// incentive now in effect, which falls back to the global value when an
+/// override is cleared.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct LiqIncentiveUpdatedEvent {
+    #[topic]
+    pub admin: Address,
+    pub asset: Option<Address>,
+    pub previous_bps: i128,
+    pub new_bps: i128,
+    pub timestamp: u64,
+}
+
+/// Interest rate model parameters changed (admin or governance action).
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RateConfigUpdatedEvent {
+    #[topic]
+    pub caller: Address,
+    pub base_rate_bps: i128,
+    pub kink_utilization_bps: i128,
+    pub slope_bps: i128,
+    pub jump_slope_bps: i128,
+    pub rate_floor_bps: i128,
+    pub rate_ceiling_bps: i128,
+    pub spread_bps: i128,
+    pub timestamp: u64,
+}
+
 /// Vault / pool deposit (static topic `deposit_event`, payload includes `new_balance`).
 #[contractevent]
 #[derive(Clone, Debug)]
